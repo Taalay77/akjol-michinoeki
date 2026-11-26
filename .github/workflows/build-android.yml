@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # GitHub ReleasesへAPKを自動アップロードするための書き込み権限
+  contents: write
 
 jobs:
   build:
@@ -37,23 +37,24 @@ jobs:
       - name: Generate native Android project
         run: npx expo prebuild --platform android --no-install
 
-      - name: Generate fixed debug keystore (for seamless overwrite install)
+      - name: Generate fixed keystore and configure release signing
         run: |
           rm -f android/app/debug.keystore
           keytool -genkey -v -keystore android/app/debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          sed -i 's/signingConfig signingConfigs.debug/signingConfig signingConfigs.debug/g' android/app/build.gradle
 
-      - name: Build Debug APK
+      - name: Build Standalone Release APK
         working-directory: android
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleRelease
 
       - name: Rename APK for direct download
-        run: cp android/app/build/outputs/apk/debug/app-debug.apk akjol-michinoeki.apk
+        run: cp android/app/build/outputs/apk/release/app-release.apk akjol-michinoeki.apk
 
       - name: Upload APK to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: AKJOL 道の駅ログ (最新版)
-          body: 最新の自動ビルド版APKです。下の「akjol-michinoeki.apk」をタップして直接ダウンロード・上書きインストールできます。
+          body: 最新の単体動作版APKです。下の「akjol-michinoeki.apk」をタップして直接ダウンロード・上書きインストールできます。
           files: akjol-michinoeki.apk
           prerelease: false
