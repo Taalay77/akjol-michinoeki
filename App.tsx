@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   StyleSheet,
   Text,
@@ -9,14 +9,17 @@ import {
   Modal,
   TextInput,
   SafeAreaView,
+  Linking,
 } from 'react-native';
 import * as Location from 'expo-location';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import stationsData from './assets/stations.json';
 
 type Station = {
   id: string;
   name: string;
   pref: string;
+  address?: string;
   lat: number;
   lng: number;
   distance?: number;
@@ -27,25 +30,9 @@ type VisitRecord = {
   memo: string;
 };
 
-// 関ヶ原周辺の主要道の駅データ（テスト＆実用初期データ）
-const STATIONS: Station[] = [
-  { id: 'gifu-ikeda', name: '道の駅 池田温泉', pref: '岐阜県', lat: 35.4419, lng: 136.5564 },
-  { id: 'shiga-ibuki', name: '道の駅 伊吹の里 旬彩の森', pref: '滋賀県', lat: 35.3886, lng: 136.3761 },
-  { id: 'gifu-nannou', name: '道の駅 月見の里 南濃', pref: '岐阜県', lat: 35.2289, lng: 136.6156 },
-  { id: 'shiga-azai', name: '道の駅 浅井三姉妹の郷', pref: '滋賀県', lat: 35.4483, lng: 136.3144 },
-  { id: 'shiga-koura', name: '道の駅 せせらぎの里こうら', pref: '滋賀県', lat: 35.1972, lng: 136.2694 },
-  { id: 'gifu-kurohone', name: '道の駅 織部の里もとす', pref: '岐阜県', lat: 35.4856, lng: 136.6639 },
-  { id: 'gifu-yoro', name: '道の駅 養老ランド（周辺・養老SAスマートIC付近）', pref: '岐阜県', lat: 35.2917, lng: 136.5514 },
-  { id: 'shiga-kohoku', name: '道の駅 湖北みずどりステーション', pref: '滋賀県', lat: 35.4411, lng: 136.2014 },
-  { id: 'shiga-hikone', name: '道の駅 彦根港（周辺・東近江あいとうマーガレット）', pref: '滋賀県', lat: 35.1389, lng: 136.2306 },
-  { id: 'gifu-tanigumi', name: '道の駅 夢さんさん谷汲', pref: '岐阜県', lat: 35.5186, lng: 136.6053 },
-  { id: 'gifu-kremers', name: '道の駅 クレール平田', pref: '岐阜県', lat: 35.2422, lng: 136.6667 },
-  { id: 'mie-inabe', name: '道の駅 いなべ（周辺・永源寺渓流の里）', pref: '滋賀県', lat: 35.0844, lng: 136.3264 },
-];
-
+const ALL_STATIONS: Station[] = stationsData as Station[];
 const STORAGE_KEY = '@akjol_michinoeki_visits_v1';
 
-// 2点間の直線距離（km）を計算するヒュベニの簡易公式（Haversine）
 function calcDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
   const R = 6371;
   const dLat = ((lat2 - lat1) * Math.PI) / 180;
@@ -61,16 +48,16 @@ function calcDistanceKm(lat1: number, lon1: number, lat2: number, lon2: number):
 }
 
 export default function App() {
-  const [sortedStations, setSortedStations] = useState<Station[]>(STATIONS);
+  const [stations, setStations] = useState<Station[]>(ALL_STATIONS);
   const [visits, setVisits] = useState<Record<string, VisitRecord>>({});
-  const [statusMsg, setStatusMsg] = useState<string>('「現在地から検索」で近い順に並び替えます');
+  const [statusMsg, setStatusMsg] = useState<string>(`全国 ${ALL_STATIONS.length} 駅データを内蔵済`);
   const [loading, setLoading] = useState<boolean>(false);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [onlyVisited, setOnlyVisited] = useState<boolean>(false);
 
-  // メモ編集モーダル用
   const [selectedStation, setSelectedStation] = useState<Station | null>(null);
   const [memoText, setMemoText] = useState<string>('');
 
-  // 初回起動時に保存済みの訪問履歴を読み込む
   useEffect(() => {
     (async () => {
       try {
@@ -82,7 +69,6 @@ export default function App() {
     })();
   }, []);
 
-  // バッテリー消費を極限まで抑えた省電力位置取得
   const searchNearby = async () => {
     setLoading(true);
     setStatusMsg('位置情報の権限を確認中...');
@@ -95,33 +81,31 @@ export default function App() {
         return;
       }
 
-      // 1. まず消費電力ゼロの端末キャッシュ（直近3分以内・精度150m以内）を確認
       let loc = await Location.getLastKnownPositionAsync({
         maxAge: 180000,
         requiredAccuracy: 150,
       });
 
-      let sourceLabel = 'キャッシュ測位（省電力）';
-
-      // 2. キャッシュが古いか無い場合のみ、省電力バランスモード（Balanced）で1回だけ測位
+      let sourceLabel = 'キャッシュ測位';
       if (!loc) {
         setStatusMsg('省電力モードで現在地を取得中...');
         loc = await Location.getCurrentPositionAsync({
           accuracy: Location.Accuracy.Balanced,
         });
-        sourceLabel = '新規バランス測位（節電）';
+        sourceLabel = '新規バランス測位';
       }
 
       const { latitude, longitude } = loc.coords;
 
-      // 距離計算して近い順にソート
-      const withDist = STATIONS.map((st) => ({
+      const withDist = ALL_STATIONS.map((st) => ({
         ...st,
         distance: calcDistanceKm(latitude, longitude, st.lat, st.lng),
       })).sort((a, b) => (a.distance ?? 9999) - (b.distance ?? 9999));
 
-      setSortedStations(withDist);
-      setStatusMsg(`更新完了（${sourceLabel}）`);
+      setStations(withDist);
+      setSearchQuery('');
+      setOnlyVisited(false);
+      setStatusMsg(`現在地から近い順に並び替え完了（${sourceLabel}）`);
     } catch (err: any) {
       setStatusMsg(`取得エラー: ${err.message}`);
     } finally {
@@ -129,7 +113,29 @@ export default function App() {
     }
   };
 
-  // 訪問記録の保存
+  // 検索・フィルター適用（描画負荷を抑えるため最大60件表示）
+  const displayedStations = useMemo(() => {
+    let list = stations;
+    if (onlyVisited) {
+      list = list.filter((st) => !!visits[st.id]);
+    }
+    if (searchQuery.trim() !== '') {
+      const q = searchQuery.trim().toLowerCase();
+      list = list.filter(
+        (st) =>
+          st.name.toLowerCase().includes(q) ||
+          st.pref.toLowerCase().includes(q) ||
+          (st.address && st.address.toLowerCase().includes(q))
+      );
+    }
+    return list.slice(0, 60);
+  }, [stations, visits, searchQuery, onlyVisited]);
+
+  const openGoogleMaps = (st: Station) => {
+    const url = `https://www.google.com/maps/dir/?api=1&destination=${st.lat},${st.lng}`;
+    Linking.openURL(url);
+  };
+
   const openVisitModal = (station: Station) => {
     setSelectedStation(station);
     setMemoText(visits[station.id]?.memo || '');
@@ -167,10 +173,11 @@ export default function App() {
         <View style={styles.headerTop}>
           <Text style={styles.title}>AKJOL 道の駅ログ</Text>
           <Text style={styles.counter}>
-            訪問済: {visitedCount} / {STATIONS.length} 駅
+            制覇: {visitedCount} / {ALL_STATIONS.length} 駅
           </Text>
         </View>
         <Text style={styles.status}>{statusMsg}</Text>
+
         <TouchableOpacity style={styles.searchBtn} onPress={searchNearby} disabled={loading}>
           {loading ? (
             <ActivityIndicator color="#ffffff" />
@@ -178,45 +185,63 @@ export default function App() {
             <Text style={styles.searchBtnText}>現在地から近い順に検索（省電力）</Text>
           )}
         </TouchableOpacity>
+
+        <View style={styles.filterRow}>
+          <TextInput
+            style={styles.filterInput}
+            placeholder="駅名・都道府県で検索（例：岐阜、群馬）"
+            placeholderTextColor="#94a3b8"
+            value={searchQuery}
+            onChangeText={setSearchQuery}
+          />
+          <TouchableOpacity
+            style={[styles.visitedFilterBtn, onlyVisited && styles.visitedFilterBtnActive]}
+            onPress={() => setOnlyVisited(!onlyVisited)}
+          >
+            <Text style={styles.visitedFilterText}>{onlyVisited ? '訪問済のみ' : 'すべて'}</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
       <FlatList
-        data={sortedStations}
+        data={displayedStations}
         keyExtractor={(item) => item.id}
         contentContainerStyle={styles.listContent}
         renderItem={({ item }) => {
           const visit = visits[item.id];
           return (
-            <TouchableOpacity
-              style={[styles.card, visit && styles.cardVisited]}
-              onPress={() => openVisitModal(item)}
-            >
-              <View style={styles.cardHeader}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.pref}>{item.pref}</Text>
-                  <Text style={styles.stationName}>{item.name}</Text>
-                </View>
-                {item.distance !== undefined && (
-                  <View style={styles.distBadge}>
-                    <Text style={styles.distText}>{item.distance.toFixed(1)} km</Text>
+            <View style={[styles.card, visit && styles.cardVisited]}>
+              <TouchableOpacity style={{ flex: 1 }} onPress={() => openVisitModal(item)}>
+                <View style={styles.cardHeader}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.pref}>{item.pref}</Text>
+                    <Text style={styles.stationName}>{item.name}</Text>
                   </View>
-                )}
-              </View>
-
-              {visit ? (
-                <View style={styles.visitBox}>
-                  <Text style={styles.visitDate}>✓ 訪問日: {visit.visitedAt}</Text>
-                  {visit.memo ? <Text style={styles.visitMemo}>{visit.memo}</Text> : null}
+                  {item.distance !== undefined && (
+                    <View style={styles.distBadge}>
+                      <Text style={styles.distText}>{item.distance.toFixed(1)} km</Text>
+                    </View>
+                  )}
                 </View>
-              ) : (
-                <Text style={styles.unvisitedText}>タップして訪問記録・車中泊メモを追加</Text>
-              )}
-            </TouchableOpacity>
+
+                {visit ? (
+                  <View style={styles.visitBox}>
+                    <Text style={styles.visitDate}>✓ 訪問日: {visit.visitedAt}</Text>
+                    {visit.memo ? <Text style={styles.visitMemo}>{visit.memo}</Text> : null}
+                  </View>
+                ) : (
+                  <Text style={styles.unvisitedText}>タップして訪問記録・車中泊メモを追加</Text>
+                )}
+              </TouchableOpacity>
+
+              <TouchableOpacity style={styles.navBtn} onPress={() => openGoogleMaps(item)}>
+                <Text style={styles.navBtnText}>Googleマップで経路案内</Text>
+              </TouchableOpacity>
+            </View>
           );
         }}
       />
 
-      {/* 訪問チェック・メモ入力モーダル */}
       <Modal visible={!!selectedStation} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
@@ -255,14 +280,32 @@ const styles = StyleSheet.create({
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
   title: { fontSize: 20, fontWeight: 'bold', color: '#ffffff' },
   counter: { fontSize: 13, color: '#38bdf8', fontWeight: 'bold' },
-  status: { fontSize: 12, color: '#94a3b8', marginTop: 4, marginBottom: 12 },
+  status: { fontSize: 12, color: '#94a3b8', marginTop: 4, marginBottom: 10 },
   searchBtn: {
     backgroundColor: '#2563eb',
-    paddingVertical: 12,
+    paddingVertical: 11,
     borderRadius: 8,
     alignItems: 'center',
   },
   searchBtnText: { color: '#ffffff', fontWeight: 'bold', fontSize: 15 },
+  filterRow: { flexDirection: 'row', marginTop: 10, gap: 8 },
+  filterInput: {
+    flex: 1,
+    backgroundColor: '#1e293b',
+    color: '#ffffff',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    fontSize: 13,
+  },
+  visitedFilterBtn: {
+    backgroundColor: '#334155',
+    paddingHorizontal: 12,
+    justifyContent: 'center',
+    borderRadius: 8,
+  },
+  visitedFilterBtnActive: { backgroundColor: '#10b981' },
+  visitedFilterText: { color: '#ffffff', fontSize: 12, fontWeight: 'bold' },
   listContent: { padding: 12 },
   card: {
     backgroundColor: '#ffffff',
@@ -289,6 +332,16 @@ const styles = StyleSheet.create({
   visitDate: { fontSize: 12, fontWeight: 'bold', color: '#059669' },
   visitMemo: { fontSize: 13, color: '#334155', marginTop: 4 },
   unvisitedText: { fontSize: 12, color: '#94a3b8', marginTop: 8 },
+  navBtn: {
+    marginTop: 10,
+    backgroundColor: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    paddingVertical: 8,
+    borderRadius: 6,
+    alignItems: 'center',
+  },
+  navBtnText: { fontSize: 12, fontWeight: 'bold', color: '#2563eb' },
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
