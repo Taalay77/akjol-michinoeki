@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "AKJOL 道の駅ログ",
+    "slug": "akjol-michinoeki",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "android": {
+      "package": "com.akjol.michinoeki",
+      "versionCode": 1,
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION"
+      ]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "近くの道の駅を自動検知するために位置情報を使用します。"
+        }
+      ]
+    ]
+  }
+}
