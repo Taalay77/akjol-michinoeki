@@ -11,6 +11,8 @@ import {
   SafeAreaView,
   Linking,
   Alert,
+  ScrollView,
+  Clipboard,
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as TaskManager from 'expo-task-manager';
@@ -31,6 +33,7 @@ type Station = {
 type VisitRecord = {
   visitedAt: string;
   memo: string;
+  tags?: string[];
   auto?: boolean;
 };
 
@@ -38,7 +41,15 @@ const ALL_STATIONS: Station[] = stationsData as Station[];
 const STORAGE_KEY = '@akjol_michinoeki_visits_v1';
 const GEOFENCE_TASK_NAME = 'AKJOL_MICHINOEKI_GEOFENCE_TASK';
 
-// 通知の表示設定（フォアグラウンドでも通知バーに出す）
+// 車中泊向けワンタップ評価タグ
+const SHACHU_TAGS = [
+  '♨️温泉併設',
+  '🚻トイレ綺麗',
+  '📐フラット',
+  '🤫静か',
+  '⭐リピ確定',
+];
+
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowAlert: true,
@@ -49,15 +60,13 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// 【バックグラウンドタスク定義】アプリを閉じていてもOSから自動起動される処理
 TaskManager.defineTask(GEOFENCE_TASK_NAME, async ({ data, error }: any) => {
   if (error) {
     console.error('ジオフェンスエラー:', error);
     return;
   }
   if (data?.eventType === Location.GeofencingEventType.Enter) {
-    const region = data.region;
-    const stationId = region?.identifier;
+    const stationId = data.region?.identifier;
     if (!stationId) return;
 
     const station = ALL_STATIONS.find((s) => s.id === stationId);
@@ -67,12 +76,12 @@ TaskManager.defineTask(GEOFENCE_TASK_NAME, async ({ data, error }: any) => {
       const savedRaw = await AsyncStorage.getItem(STORAGE_KEY);
       const visits: Record<string, VisitRecord> = savedRaw ? JSON.parse(savedRaw) : {};
 
-      // 未訪問の道の駅であれば自動チェックイン＆通知を発行
       if (!visits[stationId]) {
         const today = new Date().toISOString().split('T')[0];
         visits[stationId] = {
           visitedAt: today,
           memo: '（自動チェックイン）',
+          tags: [],
           auto: true,
         };
         await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(visits));
@@ -114,8 +123,13 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [onlyVisited, setOnlyVisited] = useState<boolean>(false);
 
+  // モーダル制御
   const [selectedStation, setSelectedStation] = useState<Station | null>(null);
   const [memoText, setMemoText] = useState<string>('');
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  const [showStatsModal, setShowStatsModal] = useState<boolean>(false);
+  const [showBackupModal, setShowBackupModal] = useState<boolean>(false);
+  const [importJsonText, setImportJsonText] = useState<string>('');
 
   const loadVisits = async () => {
     try {
@@ -134,8 +148,7 @@ export default function App() {
     })();
   }, []);
 
-  // 周囲60駅のジオフェンスをOSに登録する省電力監視セットアップ
-  const registerNearbyGeofences = async (lat: number, lng: number, sortedList: Station[]) => {
+  const registerNearbyGeofences = async (sortedList: Station[]) => {
     try {
       const { status: notifStatus } = await Notifications.requestPermissionsAsync();
       if (notifStatus !== 'granted') {
@@ -146,12 +159,11 @@ export default function App() {
       if (bgStatus !== 'granted') {
         Alert.alert(
           'バックグラウンド位置情報',
-          'アプリを閉じた状態で自動チェックインするには、位置情報設定で「常に許可」を選択してください。'
+          'アプリを閉じた状態で自動チェックインするには、設定のアプリ権限から位置情報を「常に許可」にしてください。'
         );
         return false;
       }
 
-      // Androidの上限（100件）以内に収めるため、現在地から近い上位60駅のみ登録（半径300m）
       const targets = sortedList.slice(0, 60).map((st) => ({
         identifier: st.id,
         latitude: st.lat,
@@ -164,7 +176,7 @@ export default function App() {
       await Location.startGeofencingAsync(GEOFENCE_TASK_NAME, targets);
       setGeofenceActive(true);
       return true;
-    } catch (e: any) {
+    } catch (e) {
       console.error('ジオフェンス登録エラー:', e);
       return false;
     }
@@ -192,7 +204,6 @@ export default function App() {
         return;
       }
 
-      // 最新の履歴も再読込（バックグラウンド自動チェックイン分を反映）
       await loadVisits();
 
       let loc = await Location.getLastKnownPositionAsync({
@@ -221,7 +232,7 @@ export default function App() {
       setOnlyVisited(false);
 
       if (geofenceActive || forceEnableGeofence) {
-        const ok = await registerNearbyGeofences(latitude, longitude, withDist);
+        const ok = await registerNearbyGeofences(withDist);
         if (ok) {
           setStatusMsg(`更新完了（${sourceLabel}・周囲60駅を自動監視中）`);
         } else {
@@ -237,6 +248,18 @@ export default function App() {
     }
   };
 
+  // 都道府県別の制覇率集計
+  const prefStats = useMemo(() => {
+    const map: Record<string, { pref: string; total: number; visited: number }> = {};
+    ALL_STATIONS.forEach((st) => {
+      const p = st.pref || 'その他';
+      if (!map[p]) map[p] = { pref: p, total: 0, visited: 0 };
+      map[p].total += 1;
+      if (visits[st.id]) map[p].visited += 1;
+    });
+    return Object.values(map).sort((a, b) => b.visited - a.visited || a.pref.localeCompare(b.pref));
+  }, [visits]);
+
   const displayedStations = useMemo(() => {
     let list = stations;
     if (onlyVisited) {
@@ -244,12 +267,17 @@ export default function App() {
     }
     if (searchQuery.trim() !== '') {
       const q = searchQuery.trim().toLowerCase();
-      list = list.filter(
-        (st) =>
+      list = list.filter((st) => {
+        const visit = visits[st.id];
+        const tagMatch = visit?.tags?.some((t) => t.toLowerCase().includes(q));
+        return (
           st.name.toLowerCase().includes(q) ||
           st.pref.toLowerCase().includes(q) ||
-          (st.address && st.address.toLowerCase().includes(q))
-      );
+          (st.address && st.address.toLowerCase().includes(q)) ||
+          (visit?.memo && visit.memo.toLowerCase().includes(q)) ||
+          tagMatch
+        );
+      });
     }
     return list.slice(0, 60);
   }, [stations, visits, searchQuery, onlyVisited]);
@@ -262,6 +290,13 @@ export default function App() {
   const openVisitModal = (station: Station) => {
     setSelectedStation(station);
     setMemoText(visits[station.id]?.memo || '');
+    setSelectedTags(visits[station.id]?.tags || []);
+  };
+
+  const toggleTag = (tag: string) => {
+    setSelectedTags((prev) =>
+      prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]
+    );
   };
 
   const saveVisit = async () => {
@@ -272,6 +307,7 @@ export default function App() {
       [selectedStation.id]: {
         visitedAt: visits[selectedStation.id]?.visitedAt || today,
         memo: memoText.trim(),
+        tags: selectedTags,
       },
     };
     setVisits(updated);
@@ -288,16 +324,50 @@ export default function App() {
     setSelectedStation(null);
   };
 
+  // バックアップ用：全訪問記録をJSONとしてクリップボードへコピー
+  const handleExportCopy = () => {
+    const jsonStr = JSON.stringify(visits, null, 2);
+    Clipboard.setString(jsonStr);
+    Alert.alert(
+      'コピー完了',
+      `訪問済 ${Object.keys(visits).length} 件のデータをクリップボードにコピーしました。メモ帳や1Password等に貼り付けて保管できます。`
+    );
+  };
+
+  // バックアップ復元用：貼り付けたJSONを統合
+  const handleImportMerge = async () => {
+    try {
+      const parsed = JSON.parse(importJsonText);
+      if (typeof parsed !== 'object' || parsed === null) throw new Error('形式不正');
+      const merged = { ...visits, ...parsed };
+      setVisits(merged);
+      await AsyncStorage.setItem(STORAGE_KEY, JSON.stringify(merged));
+      setImportJsonText('');
+      setShowBackupModal(false);
+      Alert.alert('復元完了', `合計 ${Object.keys(merged).length} 件の記録を保存しました。`);
+    } catch (e) {
+      Alert.alert('エラー', '正しいJSON形式のバックアップデータを貼り付けてください。');
+    }
+  };
+
   const visitedCount = Object.keys(visits).length;
+  const totalRate = ALL_STATIONS.length > 0 ? ((visitedCount / ALL_STATIONS.length) * 100).toFixed(1) : '0.0';
 
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.header}>
         <View style={styles.headerTop}>
           <Text style={styles.title}>AKJOL 道の駅ログ</Text>
-          <Text style={styles.counter}>
-            制覇: {visitedCount} / {ALL_STATIONS.length} 駅
-          </Text>
+          <View style={styles.headerRightBtns}>
+            <TouchableOpacity style={styles.badgeBtn} onPress={() => setShowStatsModal(true)}>
+              <Text style={styles.counter}>
+                制覇: {visitedCount}/{ALL_STATIONS.length} ({totalRate}%)
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.backupIconBtn} onPress={() => setShowBackupModal(true)}>
+              <Text style={styles.backupIconText}>保存</Text>
+            </TouchableOpacity>
+          </View>
         </View>
         <Text style={styles.status}>{statusMsg}</Text>
 
@@ -328,7 +398,7 @@ export default function App() {
         <View style={styles.filterRow}>
           <TextInput
             style={styles.filterInput}
-            placeholder="駅名・都道府県で検索（例：岐阜、群馬）"
+            placeholder="駅名・県名・温泉・静か等で検索"
             placeholderTextColor="#94a3b8"
             value={searchQuery}
             onChangeText={setSearchQuery}
@@ -366,10 +436,19 @@ export default function App() {
                 {visit ? (
                   <View style={styles.visitBox}>
                     <Text style={styles.visitDate}>✓ 訪問日: {visit.visitedAt}</Text>
+                    {visit.tags && visit.tags.length > 0 && (
+                      <View style={styles.tagRow}>
+                        {visit.tags.map((t) => (
+                          <Text key={t} style={styles.tagChip}>
+                            {t}
+                          </Text>
+                        ))}
+                      </View>
+                    )}
                     {visit.memo ? <Text style={styles.visitMemo}>{visit.memo}</Text> : null}
                   </View>
                 ) : (
-                  <Text style={styles.unvisitedText}>タップして訪問記録・車中泊メモを追加</Text>
+                  <Text style={styles.unvisitedText}>タップして訪問記録・車中泊タグを追加</Text>
                 )}
               </TouchableOpacity>
 
@@ -381,14 +460,33 @@ export default function App() {
         }}
       />
 
+      {/* 1. 訪問記録・車中泊タグモーダル */}
       <Modal visible={!!selectedStation} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
             <Text style={styles.modalTitle}>{selectedStation?.name}</Text>
-            <Text style={styles.modalLabel}>車中泊・駐車場・温泉などのメモ:</Text>
+            <Text style={styles.modalLabel}>車中泊・施設タグ（タップで選択）:</Text>
+            <View style={styles.tagSelectContainer}>
+              {SHACHU_TAGS.map((tag) => {
+                const active = selectedTags.includes(tag);
+                return (
+                  <TouchableOpacity
+                    key={tag}
+                    style={[styles.tagSelectBtn, active && styles.tagSelectBtnActive]}
+                    onPress={() => toggleTag(tag)}
+                  >
+                    <Text style={[styles.tagSelectText, active && styles.tagSelectTextActive]}>
+                      {tag}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            <Text style={styles.modalLabel}>車中泊・駐車場・グルメメモ:</Text>
             <TextInput
               style={styles.input}
-              placeholder="例：駐車場フラットで静か。トイレ綺麗。温泉併設。"
+              placeholder="例：第2駐車場がフラットで静か。朝市が充実。"
               value={memoText}
               onChangeText={setMemoText}
               multiline
@@ -409,6 +507,70 @@ export default function App() {
           </View>
         </View>
       </Modal>
+
+      {/* 2. 都道府県別制覇率モーダル */}
+      <Modal visible={showStatsModal} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <View style={[styles.modalBox, { maxHeight: '80%' }]}>
+            <Text style={styles.modalTitle}>都道府県別 制覇状況（タップで絞込）</Text>
+            <ScrollView style={{ marginBottom: 12 }}>
+              {prefStats.map((item) => {
+                const pct = item.total > 0 ? Math.round((item.visited / item.total) * 100) : 0;
+                return (
+                  <TouchableOpacity
+                    key={item.pref}
+                    style={styles.statRow}
+                    onPress={() => {
+                      setSearchQuery(item.pref);
+                      setShowStatsModal(false);
+                    }}
+                  >
+                    <Text style={styles.statPref}>{item.pref}</Text>
+                    <Text style={styles.statCount}>
+                      {item.visited} / {item.total} 駅 ({pct}%)
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+            <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowStatsModal(false)}>
+              <Text style={[styles.cancelBtnText, { textAlign: 'center' }]}>閉じる</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+
+      {/* 3. バックアップ・復元モーダル */}
+      <Modal visible={showBackupModal} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>訪問データのバックアップ・復元</Text>
+            <Text style={styles.modalLabel}>
+              機種変更時のデータ移行用に、全訪問履歴をJSONテキストで出力・復元できます。
+            </Text>
+            <TouchableOpacity style={styles.exportBtn} onPress={handleExportCopy}>
+              <Text style={styles.exportBtnText}>全記録をクリップボードにコピー</Text>
+            </TouchableOpacity>
+
+            <Text style={[styles.modalLabel, { marginTop: 14 }]}>バックアップから復元（貼り付け）:</Text>
+            <TextInput
+              style={[styles.input, { minHeight: 70 }]}
+              placeholder="ここにコピー済みのJSONテキストを貼り付け"
+              value={importJsonText}
+              onChangeText={setImportJsonText}
+              multiline
+            />
+            <View style={styles.modalButtons}>
+              <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowBackupModal(false)}>
+                <Text style={styles.cancelBtnText}>閉じる</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.saveBtn} onPress={handleImportMerge}>
+                <Text style={styles.saveBtnText}>データを復元</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -417,9 +579,13 @@ const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#f1f5f9' },
   header: { backgroundColor: '#0f172a', padding: 16, paddingTop: 40 },
   headerTop: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  title: { fontSize: 20, fontWeight: 'bold', color: '#ffffff' },
-  counter: { fontSize: 13, color: '#38bdf8', fontWeight: 'bold' },
-  status: { fontSize: 12, color: '#94a3b8', marginTop: 4, marginBottom: 10 },
+  headerRightBtns: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  title: { fontSize: 19, fontWeight: 'bold', color: '#ffffff' },
+  badgeBtn: { backgroundColor: '#1e293b', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
+  counter: { fontSize: 12, color: '#38bdf8', fontWeight: 'bold' },
+  backupIconBtn: { backgroundColor: '#334155', paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
+  backupIconText: { fontSize: 12, color: '#e2e8f0', fontWeight: 'bold' },
+  status: { fontSize: 12, color: '#94a3b8', marginTop: 6, marginBottom: 10 },
   actionRow: { flexDirection: 'row', gap: 8 },
   searchBtn: {
     backgroundColor: '#2563eb',
@@ -479,7 +645,17 @@ const styles = StyleSheet.create({
   distText: { fontSize: 13, fontWeight: 'bold', color: '#0f172a' },
   visitBox: { marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderTopColor: '#dcfce7' },
   visitDate: { fontSize: 12, fontWeight: 'bold', color: '#059669' },
-  visitMemo: { fontSize: 13, color: '#334155', marginTop: 4 },
+  tagRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 4, marginTop: 6 },
+  tagChip: {
+    backgroundColor: '#dcfce7',
+    color: '#166534',
+    fontSize: 11,
+    fontWeight: 'bold',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+  },
+  visitMemo: { fontSize: 13, color: '#334155', marginTop: 6 },
   unvisitedText: { fontSize: 12, color: '#94a3b8', marginTop: 8 },
   navBtn: {
     marginTop: 10,
@@ -498,14 +674,26 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   modalBox: { backgroundColor: '#ffffff', borderRadius: 12, padding: 20 },
-  modalTitle: { fontSize: 18, fontWeight: 'bold', color: '#0f172a', marginBottom: 12 },
-  modalLabel: { fontSize: 13, color: '#475569', marginBottom: 6 },
+  modalTitle: { fontSize: 17, fontWeight: 'bold', color: '#0f172a', marginBottom: 12 },
+  modalLabel: { fontSize: 12, color: '#475569', marginBottom: 6 },
+  tagSelectContainer: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 14 },
+  tagSelectBtn: {
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    backgroundColor: '#f8fafc',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+  },
+  tagSelectBtnActive: { backgroundColor: '#059669', borderColor: '#059669' },
+  tagSelectText: { fontSize: 12, color: '#334155', fontWeight: 'bold' },
+  tagSelectTextActive: { color: '#ffffff' },
   input: {
     borderWidth: 1,
     borderColor: '#cbd5e1',
     borderRadius: 8,
     padding: 10,
-    minHeight: 80,
+    minHeight: 75,
     textAlignVertical: 'top',
     marginBottom: 16,
   },
@@ -516,4 +704,20 @@ const styles = StyleSheet.create({
   cancelBtnText: { color: '#334155', fontWeight: 'bold' },
   delBtn: { backgroundColor: '#fee2e2', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 6, marginRight: 'auto' },
   delBtnText: { color: '#dc2626', fontWeight: 'bold' },
+  statRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingVertical: 10,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f1f5f9',
+  },
+  statPref: { fontSize: 14, fontWeight: 'bold', color: '#1e293b' },
+  statCount: { fontSize: 14, color: '#059669', fontWeight: 'bold' },
+  exportBtn: {
+    backgroundColor: '#2563eb',
+    paddingVertical: 11,
+    borderRadius: 8,
+    alignItems: 'center',
+  },
+  exportBtnText: { color: '#ffffff', fontWeight: 'bold', fontSize: 14 },
 });
